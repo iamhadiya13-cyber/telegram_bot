@@ -22,8 +22,8 @@ from telegram.ext import (
 # ─────────────────────────────────────────────
 # CONFIGURATION — use Railway environment variables
 # ─────────────────────────────────────────────
-BOT_TOKEN = 8700295236:AAGHsiD5uG97FXIrjaQHR9VlDa_OjxEWP5w
-OWNER_ID  = 5468913258
+BOT_TOKEN  = os.environ.get("BOT_TOKEN", "")
+OWNER_ID   = int(os.environ.get("OWNER_ID", "0"))
 EXCEL_FILE = "appointments.xlsx"
 # ─────────────────────────────────────────────
 
