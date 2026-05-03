@@ -1,9 +1,6 @@
 """
 Jivandeep Clinic - Telegram Appointment Bot
-============================================
-Uses python-telegram-bot 21.x (Bot Token approach)
-Compatible with Python 3.14
-BUG FIXED: YES no longer restarts conversation
+Railway-compatible | Python 3.13 compatible
 """
 
 import asyncio
@@ -12,7 +9,7 @@ import os
 from datetime import datetime, timedelta, time, date as date_type
 
 import openpyxl
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, BotCommand, BotCommandScopeDefault, BotCommandScopeChat
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -23,10 +20,10 @@ from telegram.ext import (
 )
 
 # ─────────────────────────────────────────────
-# CONFIGURATION
+# CONFIGURATION — use Railway environment variables
 # ─────────────────────────────────────────────
-BOT_TOKEN  = "8700295236:AAGHsiD5uG97FXIrjaQHR9VlDa_OjxEWP5w"
-OWNER_ID   = 5468913258
+BOT_TOKEN = 8700295236:AAGHsiD5uG97FXIrjaQHR9VlDa_OjxEWP5w
+OWNER_ID  = 5468913258
 EXCEL_FILE = "appointments.xlsx"
 # ─────────────────────────────────────────────
 
@@ -69,9 +66,7 @@ def save_appointment(data: dict):
     try:
         wb.save(EXCEL_FILE)
     except PermissionError:
-        raise PermissionError(
-            "appointments.xlsx is open in Excel. Please close it and try again."
-        )
+        raise PermissionError("appointments.xlsx is open. Please close it and try again.")
 
 
 def get_booked_slots(desired_date: date_type) -> list:
@@ -135,7 +130,6 @@ def is_clinic_closed(desired_date: date_type):
 # ══════════════════════════════════════════════
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Only triggered by /start command"""
     context.user_data.clear()
     keyboard = [["YES"]]
     await update.message.reply_text(
@@ -149,22 +143,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def waiting_for_yes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text.strip().upper()
-    if text == "YES":
+    if update.message.text.strip().upper() == "YES":
         await update.message.reply_text(
             "👤 Please enter your *Full Name*:",
             parse_mode="Markdown",
             reply_markup=ReplyKeyboardRemove(),
         )
         return ASK_NAME
-    else:
-        keyboard = [["YES"]]
-        await update.message.reply_text(
-            "Please reply *YES* to proceed with booking. 😊",
-            parse_mode="Markdown",
-            reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
-        )
-        return WAITING_FOR_YES
+    keyboard = [["YES"]]
+    await update.message.reply_text(
+        "Please reply *YES* to proceed with booking. 😊",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
+    )
+    return WAITING_FOR_YES
 
 
 async def ask_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -183,9 +175,7 @@ async def ask_age(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         if not (1 <= age <= 120):
             raise ValueError
         context.user_data["age"] = age
-        await update.message.reply_text(
-            "📋 Please enter the *Reason for visit*:", parse_mode="Markdown"
-        )
+        await update.message.reply_text("📋 Please enter the *Reason for visit*:", parse_mode="Markdown")
         return ASK_REASON
     except ValueError:
         await update.message.reply_text("⚠️ Invalid age. Please enter a number between 1 and 120:")
@@ -194,9 +184,7 @@ async def ask_age(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def ask_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["reason"] = update.message.text.strip()
-    await update.message.reply_text(
-        "📱 Please enter your *Mobile Number* (digits only):", parse_mode="Markdown"
-    )
+    await update.message.reply_text("📱 Please enter your *Mobile Number* (digits only):", parse_mode="Markdown")
     return ASK_MOBILE
 
 
@@ -263,8 +251,7 @@ async def ask_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         save_appointment(context.user_data)
     except PermissionError:
         await update.message.reply_text(
-            "⚠️ Could not save your appointment — the Excel file is open on the clinic PC.\n"
-            "Please close appointments.xlsx and ask the patient to try again.",
+            "⚠️ Could not save appointment. Please try again in a moment.",
             reply_markup=ReplyKeyboardRemove(),
         )
         return ConversationHandler.END
@@ -316,9 +303,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 # ══════════════════════════════════════════════
 
 async def send_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Silently ignore if not owner — no message shown to client at all
     if update.effective_user.id != OWNER_ID:
-        return
+        return  # Silent ignore
     if os.path.exists(EXCEL_FILE):
         await update.message.reply_document(
             document=open(EXCEL_FILE, "rb"),
@@ -330,9 +316,8 @@ async def send_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Silently ignore if not owner
     if update.effective_user.id != OWNER_ID:
-        return
+        return  # Silent ignore
     initialize_excel()
     wb = openpyxl.load_workbook(EXCEL_FILE)
     ws = wb.active
@@ -346,19 +331,21 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════════════════════
-#  MAIN
+#  MAIN — uses run_polling() which is Railway compatible
 # ══════════════════════════════════════════════
 
-async def main():
+def main():
+    if not BOT_TOKEN:
+        raise ValueError("BOT_TOKEN environment variable is not set!")
+    if not OWNER_ID:
+        raise ValueError("OWNER_ID environment variable is not set!")
+
     initialize_excel()
 
     app = Application.builder().token(BOT_TOKEN).build()
 
     conv_handler = ConversationHandler(
-        entry_points=[
-            # ✅ FIXED: ONLY /start triggers the conversation — not any random text
-            CommandHandler("start", start),
-        ],
+        entry_points=[CommandHandler("start", start)],
         states={
             WAITING_FOR_YES : [MessageHandler(filters.TEXT & ~filters.COMMAND, waiting_for_yes)],
             ASK_NAME        : [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_name)],
@@ -376,54 +363,10 @@ async def main():
     app.add_handler(CommandHandler("share", send_excel))
     app.add_handler(CommandHandler("stats", stats))
 
-    print("🏥 Jivandeep Clinic Bot is running...")
-    await app.initialize()
-    await app.start()
-
-    # ── Set visible commands ──────────────────────────────
-    # Clients only see /start and /cancel
-    from telegram import BotCommand, BotCommandScopeDefault, BotCommandScopeChat
-    await app.bot.set_my_commands(
-        commands=[
-            BotCommand("start",  "Book an appointment"),
-            BotCommand("cancel", "Cancel current booking"),
-        ],
-        scope=BotCommandScopeDefault(),
-    )
-    # Owner sees all commands including admin ones
-    try:
-        await app.bot.set_my_commands(
-            commands=[
-                BotCommand("start",  "Book an appointment"),
-                BotCommand("cancel", "Cancel current booking"),
-                BotCommand("send",   "📊 Get appointments Excel"),
-                BotCommand("share",  "📊 Get appointments Excel"),
-                BotCommand("stats",  "📈 View booking stats"),
-            ],
-            scope=BotCommandScopeChat(chat_id=OWNER_ID),
-        )
-    except Exception:
-        pass  # Owner hasn't started the bot yet, skip
-    # ─────────────────────────────────────────────────────
-
-    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-    print("✅ Bot is live! Press Ctrl+C to stop.")
-
-    try:
-        while True:
-            await asyncio.sleep(1)
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        pass
-    finally:
-        print("\n🛑 Shutting down...")
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
-        print("✅ Bot stopped cleanly.")
+    print("🏥 Jivandeep Clinic Bot is starting...")
+    # run_polling() handles its own event loop — works on Railway Python 3.13
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    main()
