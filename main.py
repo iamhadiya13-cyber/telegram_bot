@@ -1,3 +1,15 @@
+"""
+Jivandeep Clinic - Enhanced Telegram Appointment Bot
+=====================================================
+Features:
+  ✅ /today /tomorrow owner schedule view
+  ✅ View & cancel own appointment (/my_appointment, /cancel_appointment)
+  ✅ Appointment reminders (1 day + 1 hour before)
+  ✅ Daily summary to owner at 10 PM
+  ✅ Gujarati language support
+  ✅ Strict age / phone / date validation
+Railway + Python 3.13 compatible
+"""
 
 import asyncio
 import logging
