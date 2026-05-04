@@ -1212,8 +1212,6 @@ def main():
     if not OWNER_ID:
         raise ValueError("OWNER_ID environment variable not set!")
 
-    initialize_excel()
-
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     # Conversation
