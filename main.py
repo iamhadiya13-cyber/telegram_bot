@@ -488,14 +488,15 @@ async def ask_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         tomorrow_slot = get_available_slot(tomorrow)
         if tomorrow_slot:
             keyboard = [[tomorrow.strftime("%d/%m/%Y"), "Other Date"]]
+            d = desired_date.strftime("%d/%m/%Y")
+            t = tomorrow.strftime("%d/%m/%Y")
+            msg = (
+                "No slots available for " + d + ".\n\n"
+                "Tomorrow (" + t + ") has slots available!\n"
+                "Tap tomorrow or enter another date (DD/MM/YYYY):"
+            )
             await update.message.reply_text(
-                f"😔 No slots available for {desired_date.strftime('%d/%m/%Y')}.
-
-"
-                f"✅ *Tomorrow ({tomorrow.strftime('%d/%m/%Y')})* has slots available!
-"
-                f"Reply with tomorrow's date or enter another date (DD/MM/YYYY):",
-                parse_mode="Markdown",
+                msg,
                 reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
             )
         else:
