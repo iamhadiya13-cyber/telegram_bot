@@ -1,15 +1,3 @@
-"""
-Jivandeep Clinic - Enhanced Telegram Appointment Bot
-=====================================================
-Features:
-  ✅ /today /tomorrow owner schedule view
-  ✅ View & cancel own appointment (/my_appointment, /cancel_appointment)
-  ✅ Appointment reminders (1 day + 1 hour before)
-  ✅ Daily summary to owner at 10 PM
-  ✅ Gujarati language support
-  ✅ Strict age / phone / date validation
-Railway + Python 3.13 compatible
-"""
 
 import asyncio
 import logging
@@ -60,26 +48,27 @@ SCOPES = [
 
 def get_sheet():
     """Returns the Google Sheet worksheet. Authenticates fresh each call."""
-    # Try env variable first (for Railway), then local file
-    creds_json = os.environ.get("GOOGLE_CREDS_JSON")
-    if creds_json:
-        import tempfile
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            f.write(creds_json)
-            tmp_path = f.name
-        creds = Credentials.from_service_account_file(tmp_path, scopes=SCOPES)
-        os.unlink(tmp_path)
+    creds_json_str = os.environ.get("GOOGLE_CREDS_JSON")
+
+    if creds_json_str:
+        # Parse JSON string directly — avoids any file/newline corruption
+        creds_info = json.loads(creds_json_str)
+        # Fix private key newlines if Railway mangled them
+        if "private_key" in creds_info:
+            creds_info["private_key"] = creds_info["private_key"].replace("\\n", "\n")
+        creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
     else:
+        # Local development — use file directly
         creds = Credentials.from_service_account_file(CREDS_FILE, scopes=SCOPES)
+
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(SHEET_ID)
-    # Use first sheet or create Appointments sheet
     try:
         ws = sh.worksheet("Appointments")
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet("Appointments", rows=1000, cols=9)
-        ws.append_row(["User ID","Name","Age","Reason","Mobile",
-                       "Date","Slot Time","Booking Timestamp","Status"])
+        ws.append_row(["User ID", "Name", "Age", "Reason", "Mobile",
+                       "Date", "Slot Time", "Booking Timestamp", "Status"])
     return ws
 
 # ══════════════════════════════════════════════
