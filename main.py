@@ -22,11 +22,49 @@ from telegram.ext import (
     ContextTypes,
 )
 
+import threading
+import json
+
 # ─────────────────────────────────────────────
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-OWNER_ID  = int(os.environ.get("OWNER_ID", "0"))
+BOT_TOKEN  = os.environ.get("BOT_TOKEN", "")
+OWNER_ID   = int(os.environ.get("OWNER_ID", "0"))
 EXCEL_FILE = "appointments.xlsx"
+SLOTS_FILE = "slot_config.json"
+
+# Global lock — prevents two users booking the same slot simultaneously
+booking_lock = threading.Lock()
 # ─────────────────────────────────────────────
+
+# ══════════════════════════════════════════════
+#  SLOT CONFIG — owner can customize via /setslots
+# ══════════════════════════════════════════════
+
+DEFAULT_SLOT_CONFIG = {
+    "slot_duration_mins": 30,
+    "work_start": "09:00",
+    "work_end": "22:00",
+    "sunday_end": "13:00",
+    "lunch_start": "13:00",
+    "lunch_end": "16:00",
+    "closed_days": []          # e.g. ["Monday"] to close Mondays
+}
+
+def load_slot_config() -> dict:
+    if os.path.exists(SLOTS_FILE):
+        try:
+            with open(SLOTS_FILE) as f:
+                cfg = json.load(f)
+            # Fill in any missing keys with defaults
+            for k, v in DEFAULT_SLOT_CONFIG.items():
+                cfg.setdefault(k, v)
+            return cfg
+        except Exception:
+            pass
+    return DEFAULT_SLOT_CONFIG.copy()
+
+def save_slot_config(cfg: dict):
+    with open(SLOTS_FILE, "w") as f:
+        json.dump(cfg, f, indent=2)
 
 # Conversation states
 (CHOOSE_LANG, WAITING_FOR_YES, ASK_NAME, ASK_AGE,
@@ -262,12 +300,17 @@ def get_all_future_active_appointments() -> list:
 # ══════════════════════════════════════════════
 
 def get_available_slot(desired_date: date_type):
-    WORK_START  = time(9, 0)
-    WORK_END    = time(22, 0)
-    SUNDAY_END  = time(13, 0)
-    LUNCH_START = time(13, 0)
-    LUNCH_END   = time(16, 0)
-    SLOT_MINS   = timedelta(minutes=30)
+    """Config-driven slot finder. Uses slot_config.json if present."""
+    cfg = load_slot_config()
+
+    def t(s): return datetime.strptime(s, "%H:%M").time()
+
+    WORK_START  = t(cfg["work_start"])
+    WORK_END    = t(cfg["work_end"])
+    SUNDAY_END  = t(cfg["sunday_end"])
+    LUNCH_START = t(cfg["lunch_start"])
+    LUNCH_END   = t(cfg["lunch_end"])
+    SLOT_MINS   = timedelta(minutes=cfg["slot_duration_mins"])
 
     is_sunday     = desired_date.weekday() == 6
     effective_end = SUNDAY_END if is_sunday else WORK_END
@@ -291,11 +334,34 @@ def get_available_slot(desired_date: date_type):
 
 
 def is_clinic_closed(desired_date: date_type):
-    now = datetime.now()
+    cfg     = load_slot_config()
+    now     = datetime.now()
+    day_name = desired_date.strftime("%A")  # e.g. "Monday"
+
+    # Check owner-blocked days
+    if day_name in cfg.get("closed_days", []):
+        return True
+
+    # Sunday half-day check
     if desired_date.weekday() == 6:
-        if desired_date == now.date() and now.time() >= time(13, 0):
+        sunday_end = datetime.strptime(cfg["sunday_end"], "%H:%M").time()
+        if desired_date == now.date() and now.time() >= sunday_end:
             return True
     return False
+
+
+def atomic_book_slot(user_id: int, data: dict) -> bool:
+    """
+    Thread-safe booking — checks slot is still free and saves atomically.
+    Returns True if booked successfully, False if slot was taken by someone else.
+    """
+    with booking_lock:
+        # Re-check inside the lock to prevent race condition
+        booked = get_booked_slots(data["date"])
+        if data["slot_time"] in booked:
+            return False  # Slot was just taken by another user
+        save_appointment(user_id, data)
+        return True
 
 
 # ══════════════════════════════════════════════
@@ -512,13 +578,43 @@ async def ask_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["slot_time"] = available_slot
 
     try:
-        save_appointment(user_id, context.user_data)
+        booked = atomic_book_slot(user_id, context.user_data)
     except PermissionError:
         await update.message.reply_text(
             "⚠️ Could not save appointment. Please try again.",
             reply_markup=ReplyKeyboardRemove(),
         )
         return ConversationHandler.END
+
+    if not booked:
+        # Slot was just taken by another user — find next available
+        next_slot = get_available_slot(desired_date)
+        if next_slot:
+            context.user_data["slot_time"] = next_slot
+            booked = atomic_book_slot(user_id, context.user_data)
+            if not booked:
+                await update.message.reply_text(
+                    "⚠️ Slots are filling fast! Please try again with /start.",
+                    reply_markup=ReplyKeyboardRemove(),
+                )
+                return ConversationHandler.END
+        else:
+            tomorrow = desired_date + timedelta(days=1)
+            tomorrow_slot = get_available_slot(tomorrow)
+            if tomorrow_slot:
+                keyboard = [[tomorrow.strftime("%d/%m/%Y"), "Other Date"]]
+                await update.message.reply_text(
+                    "⚠️ That slot was just booked by someone else!\n\n"
+                    "Tomorrow has slots available. Tap to book tomorrow or enter another date:",
+                    reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
+                )
+            else:
+                await update.message.reply_text(
+                    "⚠️ That slot was just taken and no more slots are available for this date. "
+                    "Please choose another date (DD/MM/YYYY):",
+                    reply_markup=ReplyKeyboardRemove(),
+                )
+            return ASK_DATE
 
     await update.message.reply_text(
         S(user_id, "confirmed",
@@ -688,6 +784,182 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# Owner slot config states
+SET_SLOTS_MENU, SET_DURATION, SET_WORK_START, SET_WORK_END, SET_LUNCH, SET_CLOSE_DAY = range(10, 16)
+
+async def show_slot_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner: /setslots — show current config and options."""
+    if update.effective_user.id != OWNER_ID:
+        return
+    cfg = load_slot_config()
+    closed = ", ".join(cfg["closed_days"]) if cfg["closed_days"] else "None"
+    summary = (
+        f"⚙️ *Current Slot Settings*\n\n"
+        f"⏱ Slot duration   : {cfg['slot_duration_mins']} mins\n"
+        f"🌅 Work start      : {cfg['work_start']}\n"
+        f"🌆 Work end        : {cfg['work_end']}\n"
+        f"☀️ Sunday end      : {cfg['sunday_end']}\n"
+        f"🍽 Lunch break     : {cfg['lunch_start']} – {cfg['lunch_end']}\n"
+        f"🚫 Closed days     : {closed}\n\n"
+        f"Use buttons below to change settings:"
+    )
+    keyboard = [
+        [InlineKeyboardButton("⏱ Slot Duration", callback_data="cfg_duration")],
+        [InlineKeyboardButton("🌅 Work Start", callback_data="cfg_wstart"),
+         InlineKeyboardButton("🌆 Work End",   callback_data="cfg_wend")],
+        [InlineKeyboardButton("🍽 Lunch Break", callback_data="cfg_lunch")],
+        [InlineKeyboardButton("🚫 Close a Day", callback_data="cfg_closeday"),
+         InlineKeyboardButton("✅ Open a Day",  callback_data="cfg_openday")],
+        [InlineKeyboardButton("🔄 Reset to Default", callback_data="cfg_reset")],
+    ]
+    await update.message.reply_text(
+        summary, parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def slot_config_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle slot config button presses."""
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != OWNER_ID:
+        return
+
+    data = query.data
+    cfg  = load_slot_config()
+
+    if data == "cfg_reset":
+        save_slot_config(DEFAULT_SLOT_CONFIG.copy())
+        await query.edit_message_text("✅ Slot config reset to default.")
+
+    elif data == "cfg_duration":
+        context.user_data["cfg_editing"] = "duration"
+        await query.edit_message_text(
+            "⏱ Enter new slot duration in minutes\n"
+            "Examples: *15*, *20*, *30*, *45*, *60*",
+            parse_mode="Markdown"
+        )
+
+    elif data == "cfg_wstart":
+        context.user_data["cfg_editing"] = "wstart"
+        await query.edit_message_text(
+            "🌅 Enter new work start time (24hr format)\nExample: *08:00* or *09:00*",
+            parse_mode="Markdown"
+        )
+
+    elif data == "cfg_wend":
+        context.user_data["cfg_editing"] = "wend"
+        await query.edit_message_text(
+            "🌆 Enter new work end time (24hr format)\nExample: *21:00* or *22:00*",
+            parse_mode="Markdown"
+        )
+
+    elif data == "cfg_lunch":
+        context.user_data["cfg_editing"] = "lunch"
+        await query.edit_message_text(
+            "🍽 Enter lunch break as START-END (24hr)\nExample: *13:00-16:00*",
+            parse_mode="Markdown"
+        )
+
+    elif data == "cfg_closeday":
+        context.user_data["cfg_editing"] = "closeday"
+        days = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+        keyboard = [[InlineKeyboardButton(d, callback_data=f"close_{d}")] for d in days]
+        await query.edit_message_text(
+            "🚫 Which day to close?",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    elif data == "cfg_openday":
+        closed = cfg.get("closed_days", [])
+        if not closed:
+            await query.edit_message_text("No days are currently closed.")
+            return
+        keyboard = [[InlineKeyboardButton(d, callback_data=f"open_{d}")] for d in closed]
+        await query.edit_message_text(
+            "✅ Which day to reopen?",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    elif data.startswith("close_"):
+        day = data[6:]
+        if day not in cfg["closed_days"]:
+            cfg["closed_days"].append(day)
+            save_slot_config(cfg)
+        await query.edit_message_text(f"🚫 *{day}* is now closed.", parse_mode="Markdown")
+
+    elif data.startswith("open_"):
+        day = data[5:]
+        if day in cfg["closed_days"]:
+            cfg["closed_days"].remove(day)
+            save_slot_config(cfg)
+        await query.edit_message_text(f"✅ *{day}* is now open.", parse_mode="Markdown")
+
+
+async def handle_cfg_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle text replies for slot config editing (owner only)."""
+    if update.effective_user.id != OWNER_ID:
+        return
+    editing = context.user_data.get("cfg_editing")
+    if not editing:
+        return
+
+    text = update.message.text.strip()
+    cfg  = load_slot_config()
+
+    if editing == "duration":
+        if not text.isdigit() or not (5 <= int(text) <= 120):
+            await update.message.reply_text("⚠️ Enter a number between 5 and 120 minutes:")
+            return
+        cfg["slot_duration_mins"] = int(text)
+        save_slot_config(cfg)
+        await update.message.reply_text(f"✅ Slot duration set to *{text} minutes*.", parse_mode="Markdown")
+
+    elif editing in ("wstart", "wend"):
+        try:
+            datetime.strptime(text, "%H:%M")
+        except ValueError:
+            await update.message.reply_text("⚠️ Use HH:MM format e.g. 09:00")
+            return
+        key = "work_start" if editing == "wstart" else "work_end"
+        cfg[key] = text
+        save_slot_config(cfg)
+        label = "Work start" if editing == "wstart" else "Work end"
+        await update.message.reply_text(f"✅ {label} set to *{text}*.", parse_mode="Markdown")
+
+    elif editing == "lunch":
+        parts = text.split("-")
+        if len(parts) != 2:
+            await update.message.reply_text("⚠️ Use format START-END e.g. 13:00-16:00")
+            return
+        try:
+            datetime.strptime(parts[0].strip(), "%H:%M")
+            datetime.strptime(parts[1].strip(), "%H:%M")
+        except ValueError:
+            await update.message.reply_text("⚠️ Use format START-END e.g. 13:00-16:00")
+            return
+        cfg["lunch_start"] = parts[0].strip()
+        cfg["lunch_end"]   = parts[1].strip()
+        save_slot_config(cfg)
+        await update.message.reply_text(
+            f"✅ Lunch break set to *{parts[0].strip()} – {parts[1].strip()}*.",
+            parse_mode="Markdown"
+        )
+
+    context.user_data.pop("cfg_editing", None)
+    # Show updated config
+    closed = ", ".join(cfg["closed_days"]) if cfg["closed_days"] else "None"
+    await update.message.reply_text(
+        f"⚙️ *Updated Settings*\n\n"
+        f"⏱ Duration  : {cfg['slot_duration_mins']} mins\n"
+        f"🌅 Start     : {cfg['work_start']}\n"
+        f"🌆 End       : {cfg['work_end']}\n"
+        f"🍽 Lunch     : {cfg['lunch_start']} – {cfg['lunch_end']}\n"
+        f"🚫 Closed    : {closed}",
+        parse_mode="Markdown"
+    )
+
+
 async def search_patient(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
@@ -812,6 +1084,7 @@ async def post_init(app):
             BotCommand("stats",    "Booking statistics"),
             BotCommand("send",     "Get appointments Excel file"),
             BotCommand("search",   "Search patient by name"),
+            BotCommand("setslots", "Configure slot timings"),
         ]
         await app.bot.set_my_commands(
             owner_commands,
@@ -861,6 +1134,12 @@ def main():
     app.add_handler(CommandHandler("share",    send_excel))
     app.add_handler(CommandHandler("stats",    stats))
     app.add_handler(CommandHandler("search",   search_patient))
+    app.add_handler(CommandHandler("setslots", show_slot_config))
+    app.add_handler(CallbackQueryHandler(slot_config_callback, pattern="^(cfg_|close_|open_)"))
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.User(OWNER_ID),
+        handle_cfg_text
+    ))
 
     # Scheduler
     scheduler = AsyncIOScheduler()
