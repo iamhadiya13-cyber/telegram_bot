@@ -410,8 +410,11 @@ async def waiting_for_yes(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def ask_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
     name = update.message.text.strip()
-    # Validation: at least 2 chars, only letters and spaces
-    if len(name) < 2 or not all(c.isalpha() or c.isspace() for c in name):
+    # Validation: at least 2 chars
+    # isalpha() works for ALL unicode including Gujarati (ગુજરાતી), Hindi, etc.
+    # Also allow spaces and dots (for names like "Dr. Shah")
+    allowed = all(c.isalpha() or c.isspace() or c == '.' for c in name)
+    if len(name) < 2 or not allowed:
         await update.message.reply_text(S(user_id, "invalid_name"))
         return ASK_NAME
     context.user_data["name"] = name
@@ -788,6 +791,36 @@ async def send_reminders(bot):
 #  MAIN
 # ══════════════════════════════════════════════
 
+async def post_init(app):
+    """Set bot command menus after bot starts."""
+    from telegram import BotCommand, BotCommandScopeDefault, BotCommandScopeChat
+
+    # All users see these commands when they type /
+    user_commands = [
+        BotCommand("start",               "Book an appointment"),
+        BotCommand("my_appointment",      "View my current appointment"),
+        BotCommand("cancel_appointment",  "Cancel my appointment"),
+        BotCommand("cancel",              "Cancel ongoing booking"),
+    ]
+    await app.bot.set_my_commands(user_commands, scope=BotCommandScopeDefault())
+
+    # Owner also sees admin commands
+    try:
+        owner_commands = user_commands + [
+            BotCommand("today",    "Today's appointment schedule"),
+            BotCommand("tomorrow", "Tomorrow's schedule"),
+            BotCommand("stats",    "Booking statistics"),
+            BotCommand("send",     "Get appointments Excel file"),
+            BotCommand("search",   "Search patient by name"),
+        ]
+        await app.bot.set_my_commands(
+            owner_commands,
+            scope=BotCommandScopeChat(chat_id=OWNER_ID)
+        )
+    except Exception:
+        pass  # Owner hasn't started bot yet
+
+
 def main():
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN environment variable not set!")
@@ -796,7 +829,7 @@ def main():
 
     initialize_excel()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     # Conversation
     conv_handler = ConversationHandler(
