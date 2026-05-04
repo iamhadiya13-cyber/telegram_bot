@@ -138,6 +138,25 @@ def save_appointment(user_id: int, data: dict):
         raise PermissionError("Close appointments.xlsx first.")
 
 
+def get_row_status(row) -> str:
+    """Safely get status from row regardless of old/new format."""
+    # New format has 9 cols: User ID, Name, Age, Reason, Mobile, Date, Slot, Timestamp, Status
+    # Old format has 7 cols: Name, Age, Reason, Mobile, Date, Slot, Timestamp
+    if len(row) >= 9 and row[8] is not None:
+        return str(row[8])
+    return "ACTIVE"  # Old rows have no status column, treat as ACTIVE
+
+
+def get_date_col(row) -> int:
+    """Returns correct date column index based on row length."""
+    return 5 if len(row) >= 9 else 4
+
+
+def get_slot_col(row) -> int:
+    """Returns correct slot column index based on row length."""
+    return 6 if len(row) >= 9 else 5
+
+
 def get_booked_slots(desired_date: date_type) -> list:
     initialize_excel()
     wb = openpyxl.load_workbook(EXCEL_FILE)
@@ -145,12 +164,14 @@ def get_booked_slots(desired_date: date_type) -> list:
     booked = []
     for row in ws.iter_rows(min_row=2, values_only=True):
         try:
-            if row[8] == "CANCELLED":
+            if get_row_status(row) == "CANCELLED":
                 continue
-            booked_date = datetime.strptime(row[5], "%d/%m/%Y").date()
+            date_col = get_date_col(row)
+            slot_col = get_slot_col(row)
+            booked_date = datetime.strptime(row[date_col], "%d/%m/%Y").date()
             if booked_date == desired_date:
-                booked.append(row[6])
-        except (ValueError, TypeError):
+                booked.append(row[slot_col])
+        except (ValueError, TypeError, IndexError):
             continue
     return booked
 
@@ -162,13 +183,15 @@ def get_user_appointment(user_id: int):
     ws = wb.active
     result = None
     for row in ws.iter_rows(min_row=2, values_only=True):
-        if row[0] == user_id and row[8] == "ACTIVE":
-            try:
+        try:
+            if len(row) < 9:
+                continue  # Old format rows don't have user_id
+            if row[0] == user_id and get_row_status(row) == "ACTIVE":
                 appt_date = datetime.strptime(row[5], "%d/%m/%Y").date()
                 if appt_date >= datetime.now().date():
                     result = row
-            except (ValueError, TypeError):
-                continue
+        except (ValueError, TypeError, IndexError):
+            continue
     return result
 
 
@@ -180,6 +203,8 @@ def cancel_user_appointment(user_id: int) -> bool:
     cancelled = False
     for row in ws.iter_rows(min_row=2):
         vals = [c.value for c in row]
+        if len(vals) < 9:
+            continue
         if vals[0] == user_id and vals[8] == "ACTIVE":
             try:
                 appt_date = datetime.strptime(vals[5], "%d/%m/%Y").date()
@@ -201,12 +226,13 @@ def get_appointments_for_date(target_date: date_type) -> list:
     appts = []
     for row in ws.iter_rows(min_row=2, values_only=True):
         try:
-            if row[8] == "CANCELLED":
+            if get_row_status(row) == "CANCELLED":
                 continue
-            appt_date = datetime.strptime(row[5], "%d/%m/%Y").date()
+            date_col = get_date_col(row)
+            appt_date = datetime.strptime(row[date_col], "%d/%m/%Y").date()
             if appt_date == target_date:
                 appts.append(row)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, IndexError):
             continue
     return appts
 
@@ -220,12 +246,13 @@ def get_all_future_active_appointments() -> list:
     today = datetime.now().date()
     for row in ws.iter_rows(min_row=2, values_only=True):
         try:
-            if row[8] == "CANCELLED":
+            if get_row_status(row) == "CANCELLED":
                 continue
-            appt_date = datetime.strptime(row[5], "%d/%m/%Y").date()
+            date_col = get_date_col(row)
+            appt_date = datetime.strptime(row[date_col], "%d/%m/%Y").date()
             if appt_date >= today:
                 appts.append(row)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, IndexError):
             continue
     return appts
 
@@ -456,9 +483,25 @@ async def ask_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     available_slot = get_available_slot(desired_date)
     if not available_slot:
-        await update.message.reply_text(
-            S(user_id, "no_slots"), reply_markup=ReplyKeyboardRemove()
-        )
+        # Suggest tomorrow automatically
+        tomorrow = desired_date + timedelta(days=1)
+        tomorrow_slot = get_available_slot(tomorrow)
+        if tomorrow_slot:
+            keyboard = [[tomorrow.strftime("%d/%m/%Y"), "Other Date"]]
+            await update.message.reply_text(
+                f"😔 No slots available for {desired_date.strftime('%d/%m/%Y')}.
+
+"
+                f"✅ *Tomorrow ({tomorrow.strftime('%d/%m/%Y')})* has slots available!
+"
+                f"Reply with tomorrow's date or enter another date (DD/MM/YYYY):",
+                parse_mode="Markdown",
+                reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
+            )
+        else:
+            await update.message.reply_text(
+                S(user_id, "no_slots"), reply_markup=ReplyKeyboardRemove()
+            )
         return ASK_DATE
 
     context.user_data["date"]      = desired_date
