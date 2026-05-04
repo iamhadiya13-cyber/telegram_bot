@@ -1,3 +1,16 @@
+"""
+Jivandeep Clinic - Enhanced Telegram Appointment Bot
+=====================================================
+Features:
+  ✅ /today /tomorrow owner schedule view
+  ✅ View & cancel own appointment (/my_appointment, /cancel_appointment)
+  ✅ Appointment reminders (1 day + 1 hour before)
+  ✅ Daily summary to owner at 10 PM
+  ✅ Gujarati language support
+  ✅ Strict age / phone / date validation
+Railway + Python 3.13 compatible
+"""
+
 import asyncio
 import logging
 import os
@@ -68,7 +81,7 @@ def save_slot_config(cfg: dict):
 
 # Conversation states
 (CHOOSE_LANG, WAITING_FOR_YES, ASK_NAME, ASK_AGE,
- ASK_REASON, ASK_MOBILE, ASK_DATE) = range(7)
+ ASK_REASON, ASK_MOBILE, ASK_DATE, ASK_SLOT) = range(8)
 
 # Language strings
 STRINGS = {
@@ -298,6 +311,36 @@ def get_all_future_active_appointments() -> list:
 # ══════════════════════════════════════════════
 #  SLOT LOGIC
 # ══════════════════════════════════════════════
+
+def get_all_available_slots(desired_date: date_type) -> list:
+    """Returns ALL available slots for a date as a list of strings."""
+    cfg = load_slot_config()
+    def t(s): return datetime.strptime(s, "%H:%M").time()
+    WORK_START  = t(cfg["work_start"])
+    WORK_END    = t(cfg["work_end"])
+    SUNDAY_END  = t(cfg["sunday_end"])
+    LUNCH_START = t(cfg["lunch_start"])
+    LUNCH_END   = t(cfg["lunch_end"])
+    SLOT_MINS   = timedelta(minutes=cfg["slot_duration_mins"])
+    is_sunday     = desired_date.weekday() == 6
+    effective_end = SUNDAY_END if is_sunday else WORK_END
+    booked_slots  = get_booked_slots(desired_date)
+    slot_start    = datetime.combine(desired_date, WORK_START)
+    end_dt        = datetime.combine(desired_date, effective_end)
+    available = []
+    while slot_start < end_dt:
+        slot_end = slot_start + SLOT_MINS
+        if slot_end > end_dt:
+            break
+        if not is_sunday and LUNCH_START <= slot_start.time() < LUNCH_END:
+            slot_start = datetime.combine(desired_date, LUNCH_END)
+            continue
+        slot_str = f"{slot_start.strftime('%I:%M %p')} - {slot_end.strftime('%I:%M %p')}"
+        if slot_str not in booked_slots:
+            available.append(slot_str)
+        slot_start += SLOT_MINS
+    return available
+
 
 def get_available_slot(desired_date: date_type):
     """Config-driven slot finder. Uses slot_config.json if present."""
@@ -550,22 +593,19 @@ async def ask_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
         return ASK_DATE
 
-    available_slot = get_available_slot(desired_date)
-    if not available_slot:
-        # Suggest tomorrow automatically
+    # Get ALL available slots and show picker
+    available_slots = get_all_available_slots(desired_date)
+    if not available_slots:
         tomorrow = desired_date + timedelta(days=1)
-        tomorrow_slot = get_available_slot(tomorrow)
-        if tomorrow_slot:
+        tomorrow_slots = get_all_available_slots(tomorrow)
+        if tomorrow_slots:
             keyboard = [[tomorrow.strftime("%d/%m/%Y"), "Other Date"]]
             d = desired_date.strftime("%d/%m/%Y")
-            t = tomorrow.strftime("%d/%m/%Y")
-            msg = (
-                "No slots available for " + d + ".\n\n"
-                "Tomorrow (" + t + ") has slots available!\n"
-                "Tap tomorrow or enter another date (DD/MM/YYYY):"
-            )
+            t_str = tomorrow.strftime("%d/%m/%Y")
             await update.message.reply_text(
-                msg,
+                "No slots available for " + d + ".\n\n"
+                "Tomorrow (" + t_str + ") has slots!\n"
+                "Tap tomorrow or enter another date (DD/MM/YYYY):",
                 reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
             )
         else:
@@ -574,47 +614,10 @@ async def ask_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             )
         return ASK_DATE
 
-    context.user_data["date"]      = desired_date
-    context.user_data["slot_time"] = available_slot
-
-    try:
-        booked = atomic_book_slot(user_id, context.user_data)
-    except PermissionError:
-        await update.message.reply_text(
-            "⚠️ Could not save appointment. Please try again.",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return ConversationHandler.END
-
-    if not booked:
-        # Slot was just taken by another user — find next available
-        next_slot = get_available_slot(desired_date)
-        if next_slot:
-            context.user_data["slot_time"] = next_slot
-            booked = atomic_book_slot(user_id, context.user_data)
-            if not booked:
-                await update.message.reply_text(
-                    "⚠️ Slots are filling fast! Please try again with /start.",
-                    reply_markup=ReplyKeyboardRemove(),
-                )
-                return ConversationHandler.END
-        else:
-            tomorrow = desired_date + timedelta(days=1)
-            tomorrow_slot = get_available_slot(tomorrow)
-            if tomorrow_slot:
-                keyboard = [[tomorrow.strftime("%d/%m/%Y"), "Other Date"]]
-                await update.message.reply_text(
-                    "⚠️ That slot was just booked by someone else!\n\n"
-                    "Tomorrow has slots available. Tap to book tomorrow or enter another date:",
-                    reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
-                )
-            else:
-                await update.message.reply_text(
-                    "⚠️ That slot was just taken and no more slots are available for this date. "
-                    "Please choose another date (DD/MM/YYYY):",
-                    reply_markup=ReplyKeyboardRemove(),
-                )
-            return ASK_DATE
+    # Save date, show slot buttons
+    context.user_data["date"] = desired_date
+    await show_slot_picker(update, context, available_slots, desired_date)
+    return ASK_SLOT
 
     await update.message.reply_text(
         S(user_id, "confirmed",
@@ -623,10 +626,143 @@ async def ask_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
           reason=context.user_data["reason"],
           mobile=context.user_data["mobile"],
           date=desired_date.strftime("%d/%m/%Y"),
-          slot=available_slot),
+          slot=""),
         parse_mode="Markdown",
         reply_markup=ReplyKeyboardRemove(),
     )
+
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def show_slot_picker(update, context, slots: list, desired_date):
+    """Shows inline keyboard with available time slots grouped by period."""
+    user_id = update.effective_user.id
+    # Group: Morning (before 12), Afternoon (12-17), Evening (17+)
+    morning, afternoon, evening = [], [], []
+    for slot in slots:
+        start_str = slot.split(" - ")[0].strip()
+        h = datetime.strptime(start_str, "%I:%M %p").hour
+        if h < 12:
+            morning.append(slot)
+        elif h < 17:
+            afternoon.append(slot)
+        else:
+            evening.append(slot)
+
+    keyboard = []
+    if morning:
+        keyboard.append([InlineKeyboardButton("🌅 Morning", callback_data="grp_morning")])
+        # 2 slots per row
+        for i in range(0, len(morning), 2):
+            row = [InlineKeyboardButton(s, callback_data="slot_" + s) for s in morning[i:i+2]]
+            keyboard.append(row)
+    if afternoon:
+        keyboard.append([InlineKeyboardButton("☀️ Afternoon", callback_data="grp_afternoon")])
+        for i in range(0, len(afternoon), 2):
+            row = [InlineKeyboardButton(s, callback_data="slot_" + s) for s in afternoon[i:i+2]]
+            keyboard.append(row)
+    if evening:
+        keyboard.append([InlineKeyboardButton("🌆 Evening", callback_data="grp_evening")])
+        for i in range(0, len(evening), 2):
+            row = [InlineKeyboardButton(s, callback_data="slot_" + s) for s in evening[i:i+2]]
+            keyboard.append(row)
+
+    date_str = desired_date.strftime("%d/%m/%Y")
+    total    = len(slots)
+    await update.message.reply_text(
+        S(user_id, "pick_slot", date=date_str) + f"\n\n_{total} slots available_",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def ask_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handles slot selection via inline keyboard button."""
+    query   = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    data    = query.data
+
+    # Ignore group header button taps
+    if data.startswith("grp_"):
+        return ASK_SLOT
+
+    if not data.startswith("slot_"):
+        await query.edit_message_text(S(user_id, "invalid_slot"))
+        return ASK_SLOT
+
+    chosen_slot = data[5:]  # strip "slot_" prefix
+    desired_date = context.user_data.get("date")
+
+    if not desired_date:
+        await query.edit_message_text("Session expired. Please /start again.")
+        return ConversationHandler.END
+
+    # Verify slot still available
+    still_available = get_all_available_slots(desired_date)
+    if chosen_slot not in still_available:
+        # Slot was just taken — refresh picker
+        if still_available:
+            user_id = query.from_user.id
+            morning, afternoon, evening = [], [], []
+            for slot in still_available:
+                h = datetime.strptime(slot.split(" - ")[0].strip(), "%I:%M %p").hour
+                if h < 12: morning.append(slot)
+                elif h < 17: afternoon.append(slot)
+                else: evening.append(slot)
+            keyboard = []
+            for label, group in [("🌅 Morning","grp_m"),("☀️ Afternoon","grp_a"),("🌆 Evening","grp_e")]:
+                grp = morning if "M" in label else (afternoon if "A" in label else evening)
+                if grp:
+                    keyboard.append([InlineKeyboardButton(label, callback_data=label)])
+                    for i in range(0, len(grp), 2):
+                        keyboard.append([InlineKeyboardButton(s, callback_data="slot_"+s) for s in grp[i:i+2]])
+            await query.edit_message_text(
+                S(user_id, "slot_taken"),
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+        else:
+            tomorrow = desired_date + timedelta(days=1)
+            t_slots  = get_all_available_slots(tomorrow)
+            if t_slots:
+                await query.edit_message_text(
+                    "⚠️ All slots just filled for this date!\n"
+                    "Tomorrow (" + tomorrow.strftime("%d/%m/%Y") + ") has slots.\n"
+                    "Please type " + tomorrow.strftime("%d/%m/%Y") + " to book tomorrow.",
+                )
+                context.user_data["date"] = None
+                return ASK_DATE
+            else:
+                await query.edit_message_text(
+                    "😔 All slots are full. Please /start and choose another date."
+                )
+                return ConversationHandler.END
+        return ASK_SLOT
+
+    # Lock and book
+    context.user_data["slot_time"] = chosen_slot
+    try:
+        booked = atomic_book_slot(user_id, context.user_data)
+    except PermissionError:
+        await query.edit_message_text("⚠️ Could not save. Please try again.")
+        return ConversationHandler.END
+
+    if not booked:
+        await query.edit_message_text(S(user_id, "slot_taken"))
+        return ASK_SLOT
+
+    # Confirm
+    confirmation = (
+        S(user_id, "confirmed",
+          name=context.user_data["name"],
+          age=context.user_data["age"],
+          reason=context.user_data["reason"],
+          mobile=context.user_data["mobile"],
+          date=desired_date.strftime("%d/%m/%Y"),
+          slot=chosen_slot)
+    )
+    await query.edit_message_text(confirmation, parse_mode="Markdown")
 
     # Notify owner
     try:
@@ -637,7 +773,7 @@ async def ask_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 f"👤 {context.user_data['name']} | Age {context.user_data['age']}\n"
                 f"📱 {context.user_data['mobile']}\n"
                 f"📋 {context.user_data['reason']}\n"
-                f"📅 {desired_date.strftime('%d/%m/%Y')} @ {available_slot}"
+                f"📅 {desired_date.strftime('%d/%m/%Y')} @ {chosen_slot}"
             ),
             parse_mode="Markdown",
         )
@@ -1115,6 +1251,7 @@ def main():
             ASK_REASON      : [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_reason)],
             ASK_MOBILE      : [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_mobile)],
             ASK_DATE        : [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_date)],
+            ASK_SLOT        : [CallbackQueryHandler(ask_slot, pattern="^(slot_|grp_)")],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
