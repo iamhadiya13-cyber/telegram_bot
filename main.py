@@ -14,9 +14,12 @@ Railway + Python 3.13 compatible
 import asyncio
 import logging
 import os
+import threading
+import json
 from datetime import datetime, timedelta, time, date as date_type
 
-import openpyxl
+import gspread
+from google.oauth2.service_account import Credentials
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import (
     Update,
@@ -35,18 +38,49 @@ from telegram.ext import (
     ContextTypes,
 )
 
-import threading
-import json
-
 # ─────────────────────────────────────────────
-BOT_TOKEN  = os.environ.get("BOT_TOKEN", "")
-OWNER_ID   = int(os.environ.get("OWNER_ID", "0"))
-EXCEL_FILE = "appointments.xlsx"
-SLOTS_FILE = "slot_config.json"
+BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
+OWNER_ID    = int(os.environ.get("OWNER_ID", "0"))
+SHEET_ID    = os.environ.get("SHEET_ID", "1TPaWWGJS9FwxSPagMRe1e8fPPJgALtM0qWLdDKsbI3I")
+SLOTS_FILE  = "slot_config.json"
+CREDS_FILE  = "clinicsheet-bd4800acd9b6.json"
 
 # Global lock — prevents two users booking the same slot simultaneously
 booking_lock = threading.Lock()
 # ─────────────────────────────────────────────
+
+# ══════════════════════════════════════════════
+#  GOOGLE SHEETS CONNECTION
+# ══════════════════════════════════════════════
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+def get_sheet():
+    """Returns the Google Sheet worksheet. Authenticates fresh each call."""
+    # Try env variable first (for Railway), then local file
+    creds_json = os.environ.get("GOOGLE_CREDS_JSON")
+    if creds_json:
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            f.write(creds_json)
+            tmp_path = f.name
+        creds = Credentials.from_service_account_file(tmp_path, scopes=SCOPES)
+        os.unlink(tmp_path)
+    else:
+        creds = Credentials.from_service_account_file(CREDS_FILE, scopes=SCOPES)
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_key(SHEET_ID)
+    # Use first sheet or create Appointments sheet
+    try:
+        ws = sh.worksheet("Appointments")
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet("Appointments", rows=1000, cols=9)
+        ws.append_row(["User ID","Name","Age","Reason","Mobile",
+                       "Date","Slot Time","Booking Timestamp","Status"])
+    return ws
 
 # ══════════════════════════════════════════════
 #  SLOT CONFIG — owner can customize via /setslots
@@ -153,29 +187,18 @@ logger = logging.getLogger(__name__)
 
 
 # ══════════════════════════════════════════════
-#  EXCEL HELPERS
+#  GOOGLE SHEETS HELPERS
 # ══════════════════════════════════════════════
-
-HEADERS = ["User ID", "Name", "Age", "Reason", "Mobile",
-           "Date", "Slot Time", "Booking Timestamp", "Status"]
-
-def initialize_excel():
-    if not os.path.exists(EXCEL_FILE):
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = "Appointments"
-        ws.append(HEADERS)
-        wb.save(EXCEL_FILE)
-
+# Row layout: [User ID, Name, Age, Reason, Mobile, Date, Slot Time, Timestamp, Status]
+# Index:          0       1     2    3       4       5      6          7          8
 
 def save_appointment(user_id: int, data: dict):
-    initialize_excel()
-    wb = openpyxl.load_workbook(EXCEL_FILE)
-    ws = wb.active
-    ws.append([
-        user_id,
+    """Appends a new appointment row to Google Sheets."""
+    ws = get_sheet()
+    ws.append_row([
+        str(user_id),
         data["name"],
-        data["age"],
+        str(data["age"]),
         data["reason"],
         data["mobile"],
         data["date"].strftime("%d/%m/%Y"),
@@ -183,127 +206,89 @@ def save_appointment(user_id: int, data: dict):
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "ACTIVE",
     ])
-    try:
-        wb.save(EXCEL_FILE)
-    except PermissionError:
-        raise PermissionError("Close appointments.xlsx first.")
 
 
-def get_row_status(row) -> str:
-    """Safely get status from row regardless of old/new format."""
-    # New format has 9 cols: User ID, Name, Age, Reason, Mobile, Date, Slot, Timestamp, Status
-    # Old format has 7 cols: Name, Age, Reason, Mobile, Date, Slot, Timestamp
-    if len(row) >= 9 and row[8] is not None:
-        return str(row[8])
-    return "ACTIVE"  # Old rows have no status column, treat as ACTIVE
-
-
-def get_date_col(row) -> int:
-    """Returns correct date column index based on row length."""
-    return 5 if len(row) >= 9 else 4
-
-
-def get_slot_col(row) -> int:
-    """Returns correct slot column index based on row length."""
-    return 6 if len(row) >= 9 else 5
+def get_all_rows() -> list:
+    """Returns all data rows (excluding header) as list of lists."""
+    ws = get_sheet()
+    return ws.get_all_values()[1:]  # skip header row
 
 
 def get_booked_slots(desired_date: date_type) -> list:
-    initialize_excel()
-    wb = openpyxl.load_workbook(EXCEL_FILE)
-    ws = wb.active
+    """Returns list of booked slot strings for a given date."""
     booked = []
-    for row in ws.iter_rows(min_row=2, values_only=True):
+    for row in get_all_rows():
         try:
-            if get_row_status(row) == "CANCELLED":
+            if len(row) < 9 or row[8] == "CANCELLED":
                 continue
-            date_col = get_date_col(row)
-            slot_col = get_slot_col(row)
-            booked_date = datetime.strptime(row[date_col], "%d/%m/%Y").date()
-            if booked_date == desired_date:
-                booked.append(row[slot_col])
-        except (ValueError, TypeError, IndexError):
+            if datetime.strptime(row[5], "%d/%m/%Y").date() == desired_date:
+                booked.append(row[6])
+        except (ValueError, IndexError):
             continue
     return booked
 
 
 def get_user_appointment(user_id: int):
-    """Returns the latest ACTIVE appointment row for a user, or None."""
-    initialize_excel()
-    wb = openpyxl.load_workbook(EXCEL_FILE)
-    ws = wb.active
+    """Returns the latest ACTIVE future appointment for a user, or None."""
     result = None
-    for row in ws.iter_rows(min_row=2, values_only=True):
+    for row in get_all_rows():
         try:
             if len(row) < 9:
-                continue  # Old format rows don't have user_id
-            if row[0] == user_id and get_row_status(row) == "ACTIVE":
+                continue
+            if str(row[0]) == str(user_id) and row[8] == "ACTIVE":
                 appt_date = datetime.strptime(row[5], "%d/%m/%Y").date()
                 if appt_date >= datetime.now().date():
                     result = row
-        except (ValueError, TypeError, IndexError):
+        except (ValueError, IndexError):
             continue
     return result
 
 
 def cancel_user_appointment(user_id: int) -> bool:
-    """Marks user's latest active future appointment as CANCELLED."""
-    initialize_excel()
-    wb = openpyxl.load_workbook(EXCEL_FILE)
-    ws = wb.active
+    """Marks user's latest active future appointment as CANCELLED in Sheets."""
+    ws = get_sheet()
+    rows = ws.get_all_values()
     cancelled = False
-    for row in ws.iter_rows(min_row=2):
-        vals = [c.value for c in row]
-        if len(vals) < 9:
-            continue
-        if vals[0] == user_id and vals[8] == "ACTIVE":
-            try:
-                appt_date = datetime.strptime(vals[5], "%d/%m/%Y").date()
-                if appt_date >= datetime.now().date():
-                    row[8].value = "CANCELLED"
-                    cancelled = True
-            except (ValueError, TypeError):
+    for i, row in enumerate(rows[1:], start=2):  # start=2 for sheet row number
+        try:
+            if len(row) < 9:
                 continue
-    if cancelled:
-        wb.save(EXCEL_FILE)
+            if str(row[0]) == str(user_id) and row[8] == "ACTIVE":
+                appt_date = datetime.strptime(row[5], "%d/%m/%Y").date()
+                if appt_date >= datetime.now().date():
+                    # Column 9 = Status (1-indexed in Sheets)
+                    ws.update_cell(i, 9, "CANCELLED")
+                    cancelled = True
+        except (ValueError, IndexError):
+            continue
     return cancelled
 
 
 def get_appointments_for_date(target_date: date_type) -> list:
-    """Returns all active appointments for a given date, sorted by slot."""
-    initialize_excel()
-    wb = openpyxl.load_workbook(EXCEL_FILE)
-    ws = wb.active
+    """Returns all active appointments for a given date."""
     appts = []
-    for row in ws.iter_rows(min_row=2, values_only=True):
+    for row in get_all_rows():
         try:
-            if get_row_status(row) == "CANCELLED":
+            if len(row) < 9 or row[8] == "CANCELLED":
                 continue
-            date_col = get_date_col(row)
-            appt_date = datetime.strptime(row[date_col], "%d/%m/%Y").date()
-            if appt_date == target_date:
+            if datetime.strptime(row[5], "%d/%m/%Y").date() == target_date:
                 appts.append(row)
-        except (ValueError, TypeError, IndexError):
+        except (ValueError, IndexError):
             continue
     return appts
 
 
 def get_all_future_active_appointments() -> list:
-    """Returns all future active appointments for reminder checks."""
-    initialize_excel()
-    wb = openpyxl.load_workbook(EXCEL_FILE)
-    ws = wb.active
+    """Returns all future active appointments for reminders."""
     appts = []
     today = datetime.now().date()
-    for row in ws.iter_rows(min_row=2, values_only=True):
+    for row in get_all_rows():
         try:
-            if get_row_status(row) == "CANCELLED":
+            if len(row) < 9 or row[8] == "CANCELLED":
                 continue
-            date_col = get_date_col(row)
-            appt_date = datetime.strptime(row[date_col], "%d/%m/%Y").date()
-            if appt_date >= today:
+            if datetime.strptime(row[5], "%d/%m/%Y").date() >= today:
                 appts.append(row)
-        except (ValueError, TypeError, IndexError):
+        except (ValueError, IndexError):
             continue
     return appts
 
@@ -886,30 +871,24 @@ async def tomorrow_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def send_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
-    if os.path.exists(EXCEL_FILE):
-        await update.message.reply_document(
-            document=open(EXCEL_FILE, "rb"),
-            filename=EXCEL_FILE,
-            caption="📊 All appointments.",
-        )
-    else:
-        await update.message.reply_text("ℹ️ No appointments yet.")
+    await update.message.reply_text(
+        "📊 View all appointments live on Google Sheets:\n\n"
+        "https://docs.google.com/spreadsheets/d/" + SHEET_ID + "/edit",
+        parse_mode="Markdown",
+    )
 
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
-    initialize_excel()
-    wb = openpyxl.load_workbook(EXCEL_FILE)
-    ws = wb.active
     today_str = datetime.now().strftime("%d/%m/%Y")
     total, today_count, cancelled_count = 0, 0, 0
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        if row[8] == "CANCELLED":
+    for row in get_all_rows():
+        if len(row) >= 9 and row[8] == "CANCELLED":
             cancelled_count += 1
             continue
         total += 1
-        if row[5] == today_str:
+        if len(row) >= 6 and row[5] == today_str:
             today_count += 1
     await update.message.reply_text(
         f"📊 *Appointment Stats*\n\n"
@@ -1103,19 +1082,16 @@ async def search_patient(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /search <name>\nExample: /search Rahul")
         return
     query_name = " ".join(context.args).lower()
-    initialize_excel()
-    wb = openpyxl.load_workbook(EXCEL_FILE)
-    ws = wb.active
     results = []
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        if row[1] and query_name in str(row[1]).lower():
+    for row in get_all_rows():
+        if len(row) >= 2 and row[1] and query_name in str(row[1]).lower():
             results.append(row)
     if not results:
         await update.message.reply_text(f"No results for '{query_name}'.")
         return
     lines = [f"🔍 *Search: {query_name}* — {len(results)} found\n"]
     for r in results:
-        status = "✅" if r[8] == "ACTIVE" else "❌"
+        status = "✅" if (len(r) >= 9 and r[8] == "ACTIVE") else "❌"
         lines.append(f"{status} {r[1]} | {r[5]} @ {r[6]}\n   📱 {r[4]} | 📋 {r[3]}")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -1154,7 +1130,7 @@ async def send_reminders(bot):
         appts     = get_all_future_active_appointments()
 
         for appt in appts:
-            user_id    = appt[0]
+            user_id    = int(appt[0]) if str(appt[0]).isdigit() else appt[0]
             name       = appt[1]
             appt_date  = datetime.strptime(appt[5], "%d/%m/%Y").date()
             slot_start = appt[6].split(" - ")[0].strip()  # e.g. "10:30 AM"
