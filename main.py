@@ -1,3 +1,16 @@
+"""
+Jivandeep Clinic - Enhanced Telegram Appointment Bot
+=====================================================
+Features:
+  ✅ /today /tomorrow owner schedule view
+  ✅ View & cancel own appointment (/my_appointment, /cancel_appointment)
+  ✅ Appointment reminders (1 day + 1 hour before)
+  ✅ Daily summary to owner at 10 PM
+  ✅ Gujarati language support
+  ✅ Strict age / phone / date validation
+Railway + Python 3.13 compatible
+"""
+
 import asyncio
 import logging
 import os
@@ -30,7 +43,7 @@ BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
 OWNER_ID    = int(os.environ.get("OWNER_ID", "0"))
 SHEET_ID    = os.environ.get("SHEET_ID", "1TPaWWGJS9FwxSPagMRe1e8fPPJgALtM0qWLdDKsbI3I")
 SLOTS_FILE  = "slot_config.json"
-CREDS_FILE  = "clinicsheet-bd4800acd9b6.json"
+CREDS_FILE  = "clinicsheet-f489e8632a5f.json"
 
 # Global lock — prevents two users booking the same slot simultaneously
 booking_lock = threading.Lock()
@@ -46,8 +59,26 @@ SCOPES = [
 ]
 
 def get_sheet():
-    """Returns the Google Sheet worksheet. Uses JSON file directly."""
-    creds = Credentials.from_service_account_file(CREDS_FILE, scopes=SCOPES)
+    """
+    Returns the Google Sheet worksheet.
+    Priority:
+      1. GOOGLE_CREDS_JSON env variable (Railway) — JSON string
+      2. Local file CREDS_FILE (local dev only, never commit to GitHub)
+    """
+    creds_json_str = os.environ.get("GOOGLE_CREDS_JSON", "").strip()
+
+    if creds_json_str:
+        # Load from env variable — json.loads preserves \n in private key exactly
+        info = json.loads(creds_json_str)
+        creds = Credentials.from_service_account_info(info, scopes=SCOPES)
+    elif os.path.exists(CREDS_FILE):
+        creds = Credentials.from_service_account_file(CREDS_FILE, scopes=SCOPES)
+    else:
+        raise RuntimeError(
+            "No Google credentials found! "
+            "Set GOOGLE_CREDS_JSON environment variable on Railway."
+        )
+
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(SHEET_ID)
     try:
@@ -57,6 +88,25 @@ def get_sheet():
         ws.append_row(["User ID", "Name", "Age", "Reason", "Mobile",
                        "Date", "Slot Time", "Booking Timestamp", "Status"])
     return ws
+
+
+def get_all_rows_safe() -> list:
+    """Returns rows or empty list on any Google Sheets error."""
+    try:
+        return get_all_rows()
+    except Exception as e:
+        logger.error(f"Google Sheets read error: {e}")
+        return []
+
+
+def save_appointment_safe(user_id: int, data: dict) -> bool:
+    """Returns True on success, False on failure."""
+    try:
+        save_appointment(user_id, data)
+        return True
+    except Exception as e:
+        logger.error(f"Google Sheets write error: {e}")
+        return False
 
 # ══════════════════════════════════════════════
 #  SLOT CONFIG — owner can customize via /setslots
@@ -193,7 +243,7 @@ def get_all_rows() -> list:
 def get_booked_slots(desired_date: date_type) -> list:
     """Returns list of booked slot strings for a given date."""
     booked = []
-    for row in get_all_rows():
+    for row in get_all_rows_safe():
         try:
             if len(row) < 9 or row[8] == "CANCELLED":
                 continue
@@ -207,7 +257,7 @@ def get_booked_slots(desired_date: date_type) -> list:
 def get_user_appointment(user_id: int):
     """Returns the latest ACTIVE future appointment for a user, or None."""
     result = None
-    for row in get_all_rows():
+    for row in get_all_rows_safe():
         try:
             if len(row) < 9:
                 continue
@@ -243,7 +293,7 @@ def cancel_user_appointment(user_id: int) -> bool:
 def get_appointments_for_date(target_date: date_type) -> list:
     """Returns all active appointments for a given date."""
     appts = []
-    for row in get_all_rows():
+    for row in get_all_rows_safe():
         try:
             if len(row) < 9 or row[8] == "CANCELLED":
                 continue
@@ -258,7 +308,7 @@ def get_all_future_active_appointments() -> list:
     """Returns all future active appointments for reminders."""
     appts = []
     today = datetime.now().date()
-    for row in get_all_rows():
+    for row in get_all_rows_safe():
         try:
             if len(row) < 9 or row[8] == "CANCELLED":
                 continue
@@ -364,8 +414,8 @@ def atomic_book_slot(user_id: int, data: dict) -> bool:
         booked = get_booked_slots(data["date"])
         if data["slot_time"] in booked:
             return False  # Slot was just taken by another user
-        save_appointment(user_id, data)
-        return True
+        success = save_appointment_safe(user_id, data)
+        return success
 
 
 # ══════════════════════════════════════════════
@@ -555,7 +605,16 @@ async def ask_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ASK_DATE
 
     # Get ALL available slots and show picker
-    available_slots = get_all_available_slots(desired_date)
+    try:
+        available_slots = get_all_available_slots(desired_date)
+    except Exception as e:
+        logger.error(f"Sheets error in ask_date: {e}")
+        await update.message.reply_text(
+            "⚠️ Could not connect to booking system. Please try again in a moment.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return ConversationHandler.END
+    available_slots = available_slots  # already assigned above
     if not available_slots:
         tomorrow = desired_date + timedelta(days=1)
         tomorrow_slots = get_all_available_slots(tomorrow)
@@ -859,7 +918,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     today_str = datetime.now().strftime("%d/%m/%Y")
     total, today_count, cancelled_count = 0, 0, 0
-    for row in get_all_rows():
+    for row in get_all_rows_safe():
         if len(row) >= 9 and row[8] == "CANCELLED":
             cancelled_count += 1
             continue
@@ -1059,7 +1118,7 @@ async def search_patient(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     query_name = " ".join(context.args).lower()
     results = []
-    for row in get_all_rows():
+    for row in get_all_rows_safe():
         if len(row) >= 2 and row[1] and query_name in str(row[1]).lower():
             results.append(row)
     if not results:
@@ -1189,6 +1248,17 @@ def main():
         raise ValueError("OWNER_ID environment variable not set!")
 
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+
+    async def error_handler(update, context):
+        logger.error(f"Exception: {context.error}", exc_info=context.error)
+        if update and update.effective_message:
+            try:
+                await update.effective_message.reply_text(
+                    "⚠️ Something went wrong. Please try again or type /start."
+                )
+            except Exception:
+                pass
+    app.add_error_handler(error_handler)
 
     # Conversation
     conv_handler = ConversationHandler(
