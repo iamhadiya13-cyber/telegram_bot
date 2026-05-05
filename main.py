@@ -1,16 +1,3 @@
-"""
-Jivandeep Clinic - Enhanced Telegram Appointment Bot
-=====================================================
-Features:
-  ✅ /today /tomorrow owner schedule view
-  ✅ View & cancel own appointment (/my_appointment, /cancel_appointment)
-  ✅ Appointment reminders (1 day + 1 hour before)
-  ✅ Daily summary to owner at 10 PM
-  ✅ Gujarati language support
-  ✅ Strict age / phone / date validation
-Railway + Python 3.13 compatible
-"""
-
 import asyncio
 import logging
 import os
@@ -59,20 +46,8 @@ SCOPES = [
 ]
 
 def get_sheet():
-    """Returns the Google Sheet worksheet. Authenticates fresh each call."""
-    creds_json_str = os.environ.get("GOOGLE_CREDS_JSON")
-
-    if creds_json_str:
-        # Parse JSON string directly — avoids any file/newline corruption
-        creds_info = json.loads(creds_json_str)
-        # Fix private key newlines if Railway mangled them
-        if "private_key" in creds_info:
-            creds_info["private_key"] = creds_info["private_key"].replace("\\n", "\n")
-        creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
-    else:
-        # Local development — use file directly
-        creds = Credentials.from_service_account_file(CREDS_FILE, scopes=SCOPES)
-
+    """Returns the Google Sheet worksheet. Uses JSON file directly."""
+    creds = Credentials.from_service_account_file(CREDS_FILE, scopes=SCOPES)
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(SHEET_ID)
     try:
